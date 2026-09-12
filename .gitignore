@@ -23,3 +23,8 @@ Thumbs.db
 .vscode/
 *.swp
 tsconfig.tsbuildinfo
+
+# Office 임시 잠금 파일 (해당 파일을 열어둔 동안 생성됨)
+~$*.pptx
+~$*.docx
+~$*.xlsx
