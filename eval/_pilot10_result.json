@@ -1,0 +1,99 @@
+[
+  {
+    "q": "포항 사업장에 8억원짜리 신규 생산설비를 도입하려는데 협의할 부서는?",
+    "owner": "투자관리그룹",
+    "needsMoreInfo": false,
+    "partners": [
+      "설비자재구매그룹",
+      "회계세무그룹"
+    ],
+    "elapsedMs": 7668,
+    "correct": true,
+    "inScope": true
+  },
+  {
+    "q": "정확히 5억원짜리 설비를 신규 구매하려는데 심의 대상인가요?",
+    "owner": "투자관리그룹",
+    "needsMoreInfo": false,
+    "partners": [],
+    "elapsedMs": 5820,
+    "correct": true,
+    "inScope": true
+  },
+  {
+    "q": "3억원짜리 생산설비를 구매하려는데 어느 부서에 요청하나요?",
+    "owner": "설비자재구매그룹",
+    "needsMoreInfo": false,
+    "partners": [],
+    "elapsedMs": 5075,
+    "correct": true,
+    "inScope": true
+  },
+  {
+    "q": "새로 도입한 설비를 자산 등록하고 감가상각 처리하려면?",
+    "owner": "회계세무그룹",
+    "needsMoreInfo": false,
+    "partners": [],
+    "elapsedMs": 4364,
+    "correct": true,
+    "inScope": true
+  },
+  {
+    "q": "설비 공급사를 경쟁 방식으로 선정하려는데 어느 부서와 진행하나요?",
+    "owner": "설비자재구매그룹",
+    "needsMoreInfo": false,
+    "partners": [],
+    "elapsedMs": 4780,
+    "correct": true,
+    "inScope": true
+  },
+  {
+    "q": "우리 회사 조직도에서 경영기획실 산하 부서를 확인하고 싶어요",
+    "owner": "",
+    "needsMoreInfo": true,
+    "partners": [],
+    "elapsedMs": 2804,
+    "correct": true,
+    "inScope": false
+  },
+  {
+    "q": "설비를 새로 구매하려는데 어떻게 진행하나요?",
+    "owner": "",
+    "needsMoreInfo": true,
+    "partners": [
+      "설비자재구매그룹",
+      "투자관리그룹",
+      "회계세무그룹"
+    ],
+    "elapsedMs": 6231,
+    "correct": true,
+    "inScope": false
+  },
+  {
+    "q": "작업장 안전모 미착용자는 어느 부서에 신고하나요?",
+    "owner": "",
+    "needsMoreInfo": true,
+    "partners": [],
+    "elapsedMs": 2563,
+    "correct": true,
+    "inScope": false
+  },
+  {
+    "q": "이번 분기 결산 시 설비 계정과목 분류 기준을 알고 싶어요",
+    "owner": "회계세무그룹",
+    "needsMoreInfo": false,
+    "partners": [],
+    "elapsedMs": 4179,
+    "correct": true,
+    "inScope": true
+  },
+  {
+    "q": "생산라인 증설을 위해 12억 규모 설비 투자를 검토 중입니다. 실무급협의회와 투자심의회는 어떤 부서가 주관하나요?",
+    "owner": "투자관리그룹",
+    "needsMoreInfo": false,
+    "partners": [],
+    "elapsedMs": 4197,
+    "correct": true,
+    "inScope": true
+  }
+]

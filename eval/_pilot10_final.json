@@ -1,0 +1,92 @@
+[
+  {
+    "q": "포항 사업장에 8억원짜리 신규 생산설비를 도입하려는데 협의할 부서는?",
+    "expectScope": true,
+    "owner": "투자관리그룹",
+    "needsMoreInfo": false,
+    "elapsedMs": 14966,
+    "correct": true,
+    "incorrectAnswer": false
+  },
+  {
+    "q": "정확히 5억원짜리 설비를 신규 구매하려는데 심의 대상인가요?",
+    "expectScope": true,
+    "owner": "투자관리그룹",
+    "needsMoreInfo": false,
+    "elapsedMs": 5048,
+    "correct": true,
+    "incorrectAnswer": false
+  },
+  {
+    "q": "3억원짜리 생산설비를 구매하려는데 어느 부서에 요청하나요?",
+    "expectScope": true,
+    "owner": "설비자재구매그룹",
+    "needsMoreInfo": false,
+    "elapsedMs": 4711,
+    "correct": true,
+    "incorrectAnswer": false
+  },
+  {
+    "q": "새로 도입한 설비를 자산 등록하고 감가상각 처리하려면?",
+    "expectScope": true,
+    "owner": "회계세무그룹",
+    "needsMoreInfo": false,
+    "elapsedMs": 7563,
+    "correct": true,
+    "incorrectAnswer": false
+  },
+  {
+    "q": "설비 공급사를 경쟁 방식으로 선정하려는데 어느 부서와 진행하나요?",
+    "expectScope": true,
+    "owner": "설비자재구매그룹",
+    "needsMoreInfo": false,
+    "elapsedMs": 5367,
+    "correct": true,
+    "incorrectAnswer": false
+  },
+  {
+    "q": "우리 회사 조직도에서 경영기획실 산하 부서를 확인하고 싶어요",
+    "expectScope": false,
+    "owner": "",
+    "needsMoreInfo": true,
+    "elapsedMs": 2823,
+    "correct": true,
+    "incorrectAnswer": false
+  },
+  {
+    "q": "설비를 새로 구매하려는데 어떻게 진행하나요?",
+    "expectScope": false,
+    "owner": "",
+    "needsMoreInfo": true,
+    "elapsedMs": 5516,
+    "correct": true,
+    "incorrectAnswer": false
+  },
+  {
+    "q": "작업장 안전모 미착용자는 어느 부서에 신고하나요?",
+    "expectScope": false,
+    "owner": "",
+    "needsMoreInfo": true,
+    "elapsedMs": 2730,
+    "correct": true,
+    "incorrectAnswer": false
+  },
+  {
+    "q": "이번 분기 결산 시 설비 계정과목 분류 기준을 알고 싶어요",
+    "expectScope": true,
+    "owner": "회계세무그룹",
+    "needsMoreInfo": true,
+    "elapsedMs": 5964,
+    "correct": true,
+    "incorrectAnswer": false
+  },
+  {
+    "q": "생산라인 증설을 위해 12억 규모 설비 투자를 검토 중입니다. 실무급협의회와 투자심의회는 어떤 부서가 주관하나요?",
+    "expectScope": true,
+    "owner": "투자관리그룹",
+    "needsMoreInfo": false,
+    "elapsedMs": 4915,
+    "correct": true,
+    "incorrectAnswer": false
+  }
+]

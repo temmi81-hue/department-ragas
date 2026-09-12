@@ -4,6 +4,7 @@ import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { ChatOpenAI, OpenAIEmbeddings } from '@langchain/openai';
 import { MemoryVectorStore } from 'langchain/vectorstores/memory';
 import { DocxLoader } from '@langchain/community/document_loaders/fs/docx';
+import { traceable } from 'langsmith/traceable';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -53,6 +54,43 @@ function isLowValueChunk(text: string) {
   return stripped.length < 30 || /계속 진행할까요|GPT-\d/.test(text);
 }
 
+// [3차 개선 - 원인③ 근본 수정] "정확히 5억원"처럼 심의 기준 금액과 같은 경계값을 LLM이
+// 프롬프트 지시만으로 안정적으로 판단하지 못했습니다(같은 질문을 반복 호출하면 "미달"과
+// "범위밖" 사이에서 답이 흔들림 - 3차 평가에서 실측 확인). 금액 비교처럼 결정적으로 계산
+// 가능한 판단은 LLM에 맡기지 않고 서버가 정규식으로 직접 파싱·계산해서 "사실"로 프롬프트에
+// 주입합니다. "3억 5천만원", "12억원", "4천만원" 등 억/천만/만 단위 조합을 지원합니다.
+const INVESTMENT_REVIEW_THRESHOLD_WON = 500_000_000; // 5억원 - source_docs 부칙 문서 기준
+
+function parseKoreanAmountToWon(text: string): number | null {
+  let total = 0;
+  let matched = false;
+  const eokMatch = text.match(/(\d+(?:\.\d+)?)\s*억/);
+  if (eokMatch) {
+    total += parseFloat(eokMatch[1]) * 100_000_000;
+    matched = true;
+  }
+  const cheonManMatch = text.match(/(\d+(?:\.\d+)?)\s*천\s*만/);
+  if (cheonManMatch) {
+    total += parseFloat(cheonManMatch[1]) * 1000 * 10_000;
+    matched = true;
+  } else {
+    const manMatch = text.match(/(\d+(?:\.\d+)?)\s*만/);
+    if (manMatch) {
+      total += parseFloat(manMatch[1]) * 10_000;
+      matched = true;
+    }
+  }
+  return matched ? total : null;
+}
+
+// LLM에게 "판단"이 아니라 "이미 계산된 사실"로 제시할 문장을 만듭니다.
+function describeAmountFact(question: string): string {
+  const amountWon = parseKoreanAmountToWon(question);
+  if (amountWon === null) return '질문에서 구체적인 금액을 특정할 수 없습니다.';
+  const comparison = amountWon >= INVESTMENT_REVIEW_THRESHOLD_WON ? '이상' : '미만';
+  return `질문에 명시된 금액은 ${amountWon.toLocaleString('ko-KR')}원이며, 이는 투자심의 기준 금액(5억원) ${comparison}입니다.`;
+}
+
 async function buildStore() {
   const dir = path.join(process.cwd(), 'source_docs');
   const names = await fs.readdir(dir);
@@ -91,19 +129,22 @@ async function getAllowedDepartments() {
   return allowedDepartmentsPromise;
 }
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json() as { question?: string; site?: string; category?: string };
-    const question = body.question?.trim();
-    if (!question) return NextResponse.json({ error: '업무 상황을 입력해 주세요.' }, { status: 400 });
+// 이 함수 하나가 질문 접수부터 최종 JSON 응답까지 전체 파이프라인입니다.
+// traceable()로 감싸서 LangSmith에 "질문 → 검색 근거 → 최종 답변"이 하나의
+// 트레이스로 묶여 보이도록 합니다. 내부에서 호출하는 ChatOpenAI.invoke()는
+// LangSmith 트레이싱이 켜져 있으면(LANGSMITH_TRACING=true) 자동으로 이 트레이스의
+// 하위 실행(child run)으로 잡힙니다. LANGSMITH_API_KEY가 없으면 langsmith SDK가
+// 아무 것도 전송하지 않고 조용히 통과하므로, 로컬 개발에는 영향이 없습니다.
+const runRagPipeline = traceable(
+  async ({ question, site, category }: { question: string; site?: string; category?: string }) => {
     const store = await getStore();
     const allowedDepartments = await getAllowedDepartments();
     // site/category는 UI에서 선택하지 않으면 '미선택'/'자동 분류' placeholder 문자열이 그대로 넘어온다.
     // 이 값들은 실제 필터가 아니므로 검색 쿼리에 섞으면 임베딩이 오염되어(예: 관련 문서가
     // top-k에서 밀려남) 정상적으로 근거가 있는 질문도 "추가 확인 필요"로 잘못 판정될 수 있다.
     const UNSET_FILTER_VALUES = new Set(['미선택', '자동 분류']);
-    const queryParts = [question, body.site, body.category].filter(
-      (part): part is string => Boolean(part) && !UNSET_FILTER_VALUES.has(part)
+    const queryParts = [question, site, category].filter(
+      (part): part is string => typeof part === 'string' && part.length > 0 && !UNSET_FILTER_VALUES.has(part)
     );
     const queryText = queryParts.join(' / ');
     const topK = Number(process.env.RAG_TOP_K ?? 6);
@@ -130,6 +171,11 @@ export async function POST(request: Request) {
         return { department, score, docs };
       })
     );
+    if (process.env.RAG_DEBUG_SCORES === 'true') {
+      const ranked = [...primaryRelevance].sort((a, b) => b.score - a.score)
+        .map((e) => `${e.department}:${e.score.toFixed(4)}`).join('  ');
+      console.log(`[relevance] "${question}" ->`, ranked);
+    }
     const primaryDocs = primaryRelevance.flatMap((entry) => entry.docs);
     const orgChartDocs = await store.similaritySearch(
       queryText,
@@ -138,18 +184,36 @@ export async function POST(request: Request) {
     );
     const docs = [...primaryDocs, ...orgChartDocs];
     const context = docs.map((doc, index) => `[근거 ${index + 1}] ${doc.pageContent}\n출처: ${doc.metadata.document}\n부서: ${doc.metadata.department}\n업무 유형: ${doc.metadata.workType}`).join('\n\n');
-    const model = new ChatOpenAI({ model: 'gpt-4o-mini', temperature: 0 });
+    // [3차 개선] gpt-4o-mini -> GPT-5.6 Luna로 기본 모델 교체. 골든셋 19건 재평가에서
+    // 코드/프롬프트 변경 없이 모델만 바꿨는데 주관부서 매칭 정확도가 79%->95%로 크게
+    // 오른 것을 확인해 기본값으로 채택했습니다(단, 응답속도는 약 2배 느려짐 - 라이브 데모 시 참고).
+    // RAG_CHAT_MODEL 환경변수로 다른 모델(예: 'gpt-4o-mini')로 되돌릴 수 있습니다.
+    // o-시리즈/GPT-5 계열 "추론 모델"은 temperature 파라미터 자체를 지원하지 않아(실제 호출 시
+    // "temperature does not support 0" 400 에러 확인) 조건부로 뺍니다.
+    const CHAT_MODEL = process.env.RAG_CHAT_MODEL ?? 'gpt-5.6-luna';
+    const isReasoningModel = /^(o\d|gpt-5)/i.test(CHAT_MODEL);
+    const model = new ChatOpenAI(
+      isReasoningModel ? { model: CHAT_MODEL } : { model: CHAT_MODEL, temperature: 0 }
+    );
     const response = await model.invoke([
       ['system', [
         '당신은 사내 업무분장 안내 도우미입니다. 이 데모는 투자·공사, 재무·회계, 설비·자재 구매 관련 업무만 다룹니다. 제공된 근거만 사용하세요.',
         `owner와 partners는 반드시 다음 부서 목록 중에서만 선택하세요: ${allowedDepartments.join(', ')}. 목록에 없는 부서명은 절대 만들어내지 마세요.`,
         '질문이 투자·공사, 재무·회계, 설비·자재 구매와 무관하거나(예: 안전·인사 등), 근거에 목록 안의 부서가 명확히 나오지 않으면 owner를 빈 문자열로 두고 needsMoreInfo를 true로 하여 reason에 "투자·회계·구매 관련 업무가 아니거나 추가 확인이 필요합니다"라고 답하세요. 부서를 추측하지 마세요.',
-        'partners(협업 부서)는 owner보다 기준을 넓게 적용하세요: 근거 문서 안에서 같은 업무·공정과 관련해 함께 등장하거나, owner의 상위/인접 조직이거나, 절차상 연결되는 부서가 있다면 위 목록 안에서 모두 partners에 포함하세요. owner와 동일한 부서는 partners에 절대 중복 포함하지 마세요. 정말로 관련 부서를 전혀 찾을 수 없을 때만 partners를 빈 배열로 두세요.',
+        // [3차 개선 - 원인②] 기존 지시("owner보다 기준을 넓게, 같은 문서에 등장하면 모두 포함")는
+        // 더미 문서들이 서로의 부서명을 인용하는 구조상 거의 모든 질문에서 3개 부서를 통째로
+        // partners에 담게 만들었다(예: 자산등록만 묻는 질문에도 구매·투자 부서까지 포함).
+        // "질문이 실제로 다루는 절차 단계"로 기준을 좁혀 정밀도를 높인다.
+        'partners(협업 부서)는 질문이 실제로 묻는 절차 단계와 직접 관련된 부서만 포함하세요. 근거 문서에 같은 표(R&R 표 등)에 나열되어 있다는 이유만으로 무관한 단계의 부서를 넣지 마세요 - 예를 들어 질문이 회계처리(자산등록·감가상각)만 묻는다면 구매 실행이나 투자심의 단계 부서는 partners에 넣지 마세요. 질문이 여러 단계(투자심의~구매~회계처리)를 함께 묻거나 전체 절차를 묻는 경우에만 관련된 여러 부서를 partners에 포함하세요. owner와 동일한 부서는 partners에 절대 중복 포함하지 마세요.',
         '여러 부서가 근거에 함께 등장하고 그중 일정 금액 기준(예: 5억원) 이상 여부를 심의·승인하는 절차(투자심의회 등)를 주관하는 부서가 있다면, 그 심의 주관 부서를 owner로 선택하고 나머지(구매 실행, 회계처리 등 후속 업무를 담당하는 부서)는 partners에 포함하세요. 심의 절차 없이 실행·처리 업무만 언급된 경우에는 그 실행 부서를 owner로 선택하세요.',
-        '질문에 구체적인 금액이 명시되어 있고 근거 문서에 나온 심의 기준 금액에 미달하는 경우, 이는 범위 밖 질문이 아닙니다: 심의 주관 부서(예: 투자관리그룹)를 owner로 선택하지 말고, 대신 실행 부서(예: 설비자재구매그룹)를 owner로 선택한 뒤 needsMoreInfo는 false로, reason에는 기준 금액 미달로 내부 승인만으로 진행 가능하다는 취지를 적으세요. owner를 빈 문자열로 두거나 needsMoreInfo를 true로 하지 마세요.',
+        // [3차 개선 - 원인③ 근본 수정] "정확히 5억원" 같은 경계값을 LLM이 직접 계산하게 하면
+        // 같은 질문에도 답이 흔들렸습니다(3차 평가에서 실측). 그래서 서버가 정규식으로 금액을
+        // 미리 계산해 human 메시지의 "금액 판정"으로 사실을 못박아 주입합니다. LLM은 그 판정을
+        // 그대로 따르기만 하면 되고, 스스로 금액을 다시 읽고 비교할 필요가 없습니다.
+        '아래 human 메시지의 "금액 판정"은 서버가 이미 계산해 둔 사실입니다. 금액 판정은 "설비·장비를 신규로 구매/도입할지 결정하는 단계"에서 투자심의 대상 여부(owner가 투자관리그룹인지 설비자재구매그룹인지)를 가릴 때만 사용하세요 - 이 경우 질문 속 금액을 스스로 다시 읽고 5억원과 비교하지 말고 판정을 그대로 따르세요: "5억원 이상"이면 심의 주관 부서(예: 투자관리그룹)를 owner로, "미달"이면 실행 부서(예: 설비자재구매그룹)를 owner로 선택하고 needsMoreInfo는 false로 하세요(미달은 범위 밖이 아니라 내부 승인 대상입니다). 이 경우에 한해 판정이 "특정할 수 없습니다"이면 부서를 추측하지 말고 owner를 빈 문자열로, needsMoreInfo를 true로 하여 reason에 금액 확인이 필요하다고 답하세요. 반대로 질문이 이미 구매 이후의 특정 절차(공급사 선정, 계약 체결, 검수·대금지급, 수의계약, 자산등록, 결산 등)를 묻고 있다면 애초에 금액과 무관하게 owner가 정해지므로, 금액 판정이 "특정할 수 없습니다"여도 owner를 비우지 말고 해당 절차를 담당하는 부서로 정상 답변하세요.',
         'JSON 이외의 글은 출력하지 마세요.'
       ].join(' ')],
-      ['human', `질문: ${question}\n사업장: ${body.site ?? '미선택'}\n업무 유형: ${body.category ?? '자동 분류'}\n\n검색 근거:\n${context}\n\n다음 JSON 형식으로 답하세요: {"needsMoreInfo": boolean, "owner": string, "partners": string[] (관련 부서를 최대한 근거 안에서 찾아 포함, 정말 없으면만 빈 배열), "reason": string, "evidence": [{"quote": string, "source": string}]}`]
+      ['human', `질문: ${question}\n사업장: ${site ?? '미선택'}\n업무 유형: ${category ?? '자동 분류'}\n금액 판정: ${describeAmountFact(question)}\n\n검색 근거:\n${context}\n\n다음 JSON 형식으로 답하세요: {"needsMoreInfo": boolean, "owner": string, "partners": string[] (관련 부서를 최대한 근거 안에서 찾아 포함, 정말 없으면만 빈 배열), "reason": string, "evidence": [{"quote": string, "source": string}]}`]
     ]);
     const raw = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
     const result = JSON.parse(raw.replace(/^```json\s*|\s*```$/g, '').trim());
@@ -159,8 +223,8 @@ export async function POST(request: Request) {
     const allowedSet = new Set(allowedDepartments);
     const ownerAllowed = typeof result.owner === 'string' && allowedSet.has(result.owner);
     const safeOwner = ownerAllowed ? result.owner : '';
-    const safePartners = Array.isArray(result.partners)
-      ? result.partners.filter((partner: unknown) => typeof partner === 'string' && allowedSet.has(partner) && partner !== safeOwner)
+    const safePartners: string[] = Array.isArray(result.partners)
+      ? result.partners.filter((partner: unknown): partner is string => typeof partner === 'string' && allowedSet.has(partner) && partner !== safeOwner)
       : [];
     // 온도 0이라도 LLM 호출은 완전히 결정적이지 않습니다. 근거(관련성 임계값을 통과한
     // primaryDocs)가 이미 확보돼 있는데도 LLM이 가끔 needsMoreInfo:true로 답하는 사례가
@@ -180,20 +244,52 @@ export async function POST(request: Request) {
     const relevantPrimary = primaryRelevance
       .filter((entry) => entry.docs.length > 0)
       .sort((a, b) => b.score - a.score);
+    // [3차 개선 - 원인① 1차 수정] 골든셋 평가에서 이 폴백이 "관련 부서가 하나도 없거나(org-001의
+    // 조직도 질문) 근거가 아예 없는(lease-002의 리스 회계처리)" 질문에도 관련성 임계값(0.4)을
+    // 우연히 넘긴 부서가 하나라도 있으면 억지로 owner를 채워버리는 문제를 확인했습니다
+    // (그 결과 reason이 LLM의 실제 판단이 아니라 아래 정형 문구로 덮어써짐).
+    // 1차 수정은 "부서가 정확히 1개일 때만 적용"으로 막았으나, 이 개수 기준은 acc-002처럼
+    // 부서 2~3개가 걸려도 1위가 뚜렷하게 앞서는 정당한 케이스까지 함께 걸러내는 부작용이
+    // 있었습니다(재평가로 확인).
+    // [원인① 2차 수정 - 점수 격차 기반] 골든셋 9개 케이스의 실제 유사도 점수를 계측한 결과
+    // (RAG_DEBUG_SCORES=true로 로깅), 1위-2위 점수 격차가 0.06~0.14인 경우는 1위가 항상
+    // 정답이었고, 격차가 0.005~0.033인 경우는 1위가 정답이 아니거나(acc-001) 애초에 관련
+    // 부서가 없는 질문(org-001, lease-002)이었습니다. 그래서 "개수"가 아니라 "1위가 2위를
+    // 얼마나 확실하게 앞서는지"로 기준을 바꿉니다. 부서가 1개만 걸린 경우는 비교 대상이 없어
+    // 그대로 인정하고, 2개 이상이면 격차가 RELEVANCE_MARGIN 이상일 때만 1위를 신뢰합니다.
+    // (다만 acc-001처럼 격차 자체가 애초에 거의 없는 경우는 이 로직으로도 구제되지 않고
+    // LLM의 needsMoreInfo 판단을 그대로 따릅니다 - 이건 임베딩 신호 자체가 약한 근본적 한계로,
+    // 다음 단계에서는 검색 방식 자체(재순위화 등) 개선이 필요합니다.)
+    const RELEVANCE_MARGIN = 0.05;
+    const hasDominantWinner = relevantPrimary.length === 1
+      || (relevantPrimary.length > 1 && relevantPrimary[0].score - relevantPrimary[1].score >= RELEVANCE_MARGIN);
     let finalOwner = safeOwner;
     let finalPartners = safePartners;
     let finalNeedsMoreInfo = ownerAllowed ? result.needsMoreInfo : true;
     let finalReason = typeof result.reason === 'string' ? result.reason : '';
-    if (!finalOwner && !declinedWithSpecificReason && relevantPrimary.length > 0) {
+    if (!finalOwner && !declinedWithSpecificReason && hasDominantWinner) {
       finalOwner = relevantPrimary[0].department;
       finalNeedsMoreInfo = false;
-      finalPartners = [...new Set([...safePartners, ...relevantPrimary.slice(1).map((entry) => entry.department)])].filter(
-        (partner) => partner !== finalOwner
-      );
+      // [3차 개선] 이전에는 2위 이하 부서를 전부 partners로 끼워넣었으나, 격차 기반 판단의
+      // 전제 자체가 "2위 이하는 신뢰할 수 없는 노이즈"라는 것이므로 여기서도 동일하게
+      // 기계적으로 추가하지 않습니다(재평가에서 inv-006/proc-002가 owner는 맞았지만 이
+      // 기계적 추가 때문에 partners가 틀리는 것을 확인). LLM이 스스로 찾은 partners(safePartners)만 사용합니다.
+      finalPartners = safePartners.filter((partner) => partner !== finalOwner);
       finalReason = '검색된 지침 근거에서 관련 부서가 확인되어 자동으로 매칭되었습니다.';
     }
     const safeResult = { ...result, owner: finalOwner, partners: finalPartners, needsMoreInfo: finalNeedsMoreInfo, reason: finalReason };
-    return NextResponse.json({ ...safeResult, retrieved: docs.map((doc) => ({ content: doc.pageContent, ...doc.metadata })) });
+    return { ...safeResult, retrieved: docs.map((doc) => ({ content: doc.pageContent, ...doc.metadata })) };
+  },
+  { name: 'rag-department-match', run_type: 'chain' }
+);
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json() as { question?: string; site?: string; category?: string };
+    const question = body.question?.trim();
+    if (!question) return NextResponse.json({ error: '업무 상황을 입력해 주세요.' }, { status: 400 });
+    const result = await runRagPipeline({ question, site: body.site, category: body.category });
+    return NextResponse.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'RAG 검색 중 오류가 발생했습니다.';
     return NextResponse.json({ error: message }, { status: 500 });

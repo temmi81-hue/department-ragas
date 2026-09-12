@@ -1,0 +1,297 @@
+{
+  "_readme": [
+    "이 파일은 3차(LangSmith + RAGAS) 검색 품질 평가를 위한 골든셋입니다.",
+    "2026-09-12 검토 완료: source_docs/*.docx 5개 원문을 mammoth로 전문 추출해",
+    "expected 값을 원문 대조로 확정했습니다(추출 결과: eval/_dump_*.txt).",
+    "reviewNeeded: true 인 항목만 아직 확정하지 못한 케이스이며, 그 이유는",
+    "각 case의 rationale 끝에 '(미확정 사유: ...)' 형태로 남겨뒀습니다.",
+    "핵심 발견: public/instruction_workflows.json은 app/ 코드 어디서도 로드되지",
+    "않는 미사용 데이터입니다. /api/rag는 source_docs/*.docx만 색인하므로,",
+    "instruction_workflows.json에만 있고 source_docs에는 없는 내용(리스·렌탈의",
+    "사용권자산 회계처리 등)은 근거가 없어 needsMoreInfo:true가 정답입니다.",
+    "필드 설명 - owner: /api/rag가 반환해야 할 주관 부서(빈 문자열이면 범위밖/확인필요),",
+    "partners: 함께 등장해야 할 협업 부서 배열, needsMoreInfo: 근거 부족으로 봐야 하는지,",
+    "evidenceDocuments: 근거로 인용되어야 할 source_docs 파일명(부분 일치),",
+    "category: 테스트 목적 분류(아래 카테고리 설명 참고)."
+  ],
+  "_categories": {
+    "clear-in-scope": "금액·업무가 명확해 owner가 하나로 확정되어야 하는 케이스",
+    "below-threshold": "심의 기준(5억) 미만 금액 - 실행 부서가 owner가 되어야 하는 케이스",
+    "boundary": "심의 기준 금액과 정확히 같거나 근접한 경계값 케이스",
+    "accounting-focus": "회계처리·자산화·결산 관점 질문",
+    "procurement-focus": "공급사 선정·계약 등 구매 실행 관점 질문",
+    "multi-step-process": "여러 부서가 순차적으로 관여하는 절차형 질문(owner는 진입 단계 담당 부서)",
+    "corpus-gap": "주제는 범위 안이지만 source_docs 원문에 근거가 없어 needsMoreInfo:true가 정답인 케이스",
+    "out-of-scope": "투자·회계·구매 범위 밖(안전·인사 등) - needsMoreInfo:true가 정답",
+    "underspecified": "금액 등 핵심 정보가 빠져 있어 확인이 필요할 수 있는 질문",
+    "org-chart-only": "조직도性 질문 - 화이트리스트 설계상 owner가 없어야 하는 케이스"
+  },
+  "cases": [
+    {
+      "id": "inv-001",
+      "category": "clear-in-scope",
+      "question": "포항 사업장에 8억원짜리 신규 생산설비를 도입하려고 하는데 어느 부서와 협의해야 하나요?",
+      "site": "포항",
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "투자관리그룹",
+        "partners": ["설비자재구매그룹", "회계세무그룹"],
+        "evidenceDocuments": ["타당성 평가 및 심의 지침", "구매관리규정", "회계관리규정"]
+      },
+      "rationale": "instruction_workflows.json new-equipment-investment 시나리오 그대로. 5억 이상이므로 투자관리그룹이 타당성평가·심의 주관.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "inv-002",
+      "category": "clear-in-scope",
+      "question": "생산라인 증설을 위해 12억 규모 설비 투자를 검토 중입니다. 타당성 평가는 누가 진행하나요?",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "투자관리그룹",
+        "partners": ["설비자재구매그룹", "회계세무그룹"],
+        "evidenceDocuments": ["타당성 평가 및 심의 지침"]
+      },
+      "rationale": "inv-001과 동일 패턴, 표현만 다르게 (일반화 확인용).",
+      "reviewNeeded": false
+    },
+    {
+      "id": "inv-003",
+      "category": "boundary",
+      "question": "정확히 5억원짜리 설비를 신규 구매하려고 합니다. 심의를 받아야 하나요?",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "투자관리그룹",
+        "partners": ["설비자재구매그룹", "회계세무그룹"],
+        "evidenceDocuments": ["타당성 평가 및 심의 지침"]
+      },
+      "rationale": "확정: 부칙 문서(적용대상 해설)에 '5억원 이상 생산설비 신규 구매'가 명시적 적용대상으로 나와 있어 5억 정확히도 포함됨.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "inv-004",
+      "category": "below-threshold",
+      "question": "3억원짜리 생산설비를 새로 구매하려고 합니다. 어느 부서에 요청해야 하나요?",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "설비자재구매그룹",
+        "partners": ["회계세무그룹"],
+        "evidenceDocuments": ["구매관리규정"]
+      },
+      "rationale": "route.ts:149 주석의 명시적 케이스 - 기준 미달 시 심의 주관 부서(투자관리그룹) 대신 실행 부서(설비자재구매그룹)를 owner로.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "inv-005",
+      "category": "below-threshold",
+      "question": "설비 보수용 부품을 4천만원 정도에 구매하려고 하는데 절차가 어떻게 되나요?",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "설비자재구매그룹",
+        "partners": [],
+        "evidenceDocuments": ["구매관리규정"]
+      },
+      "rationale": "확정: 구매관리규정은 '생산설비 신규구매' 전용 지침이 아니라 물품구매·계약 전반(제1조)을 다루므로 소액 부품 구매도 설비자재구매그룹 소관. 5억 미만이라 투자관리그룹 심의 불필요, 보수용 소모성 부품은 자산화 이슈가 크지 않아 회계세무그룹도 불필요로 판단.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "acc-001",
+      "category": "accounting-focus",
+      "question": "새로 도입한 생산설비를 자산으로 등록하고 감가상각을 시작하려면 어떻게 처리하나요?",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "회계세무그룹",
+        "partners": [],
+        "evidenceDocuments": ["회계관리규정"]
+      },
+      "rationale": "instruction_workflows new-equipment-investment step 5(전표 작성 및 자산·결산 관리)의 owner.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "acc-002",
+      "category": "accounting-focus",
+      "question": "이번 분기 결산 시 설비 관련 계정과목 분류 기준을 확인하고 싶습니다.",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "회계세무그룹",
+        "partners": [],
+        "evidenceDocuments": ["회계관리규정"]
+      },
+      "rationale": "결산·계정분류는 회계관리규정 소관.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "proc-001",
+      "category": "procurement-focus",
+      "question": "설비 공급사 2곳 중 하나를 경쟁 방식으로 선정하려고 합니다. 어느 부서와 진행하나요?",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "설비자재구매그룹",
+        "partners": [],
+        "evidenceDocuments": ["구매관리규정"]
+      },
+      "rationale": "instruction_workflows step 3(구매방법 결정 및 공급사 평가)의 owner.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "proc-002",
+      "category": "procurement-focus",
+      "question": "설비 계약 체결 후 검수 기준과 대금 지급 절차를 알고 싶습니다.",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "설비자재구매그룹",
+        "partners": [],
+        "evidenceDocuments": ["구매관리규정"]
+      },
+      "rationale": "수정됨(원문 대조): 구매관리규정 제11~15조(계약서 작성, 대금지급·정산, 보증·하자)가 전부 설비자재구매그룹(계약담당자) 단독 소관으로 규정되어 있고 회계세무그룹 언급이 없음. 초안에서 partners에 회계세무그룹을 넣었던 것은 근거 없는 추측이었음 - 자산등록/감가상각은 '구매 확정 이후' 별도 단계(acc-001)이지 검수·대금지급 자체의 partner가 아님.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "lease-001",
+      "category": "multi-step-process",
+      "question": "생산설비를 구매 대신 3년 리스로 도입하려고 합니다. 어느 부서와 먼저 협의해야 하나요?",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "설비자재구매그룹",
+        "partners": [],
+        "evidenceDocuments": ["구매관리규정"]
+      },
+      "rationale": "수정됨(원문 대조): 구매관리규정 제2조①에 '자산의 매매, 임대차 등 계약'이 규정 적용대상으로 명시되어 있어 리스(임대차) 계약도 설비자재구매그룹 소관 근거가 존재. 다만 partners는 초안의 투자관리그룹/회계세무그룹을 뒷받침할 원문 근거가 없어 제거함. (미확정 사유: '리스'와 원문 표현 '임대차'의 임베딩 유사도가 실제로 충분히 높아 이 청크가 top-k에 걸리는지는 코드 확인이 아니라 API를 직접 호출해봐야 확정 가능 - 검색 품질 개선 단계에서 실측 필요)",
+      "reviewNeeded": true
+    },
+    {
+      "id": "lease-002",
+      "category": "corpus-gap",
+      "question": "설비 리스 계약이 사용권자산으로 인식되는지 확인하고 싶습니다.",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": true,
+        "owner": "",
+        "partners": [],
+        "evidenceDocuments": []
+      },
+      "rationale": "수정됨(원문 대조): 회계관리규정.docx 전문을 확인했으나 '리스'·'사용권자산'·'리스부채' 등 관련 조항이 전혀 없음. public/instruction_workflows.json에는 이 시나리오가 있지만 이 파일은 app/ 코드에서 전혀 로드되지 않는 미사용 데이터라 RAG의 실제 근거가 될 수 없음. 근거 문서가 없으므로 needsMoreInfo:true(확인 필요)가 정답 - 만약 앱이 owner를 추측해서 낸다면 이는 '근거 없는 추측 방지' 프롬프트 지시를 어긴 것이므로 오히려 좋은 실패 탐지 케이스임.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "oos-001",
+      "category": "out-of-scope",
+      "question": "작업장에서 안전모 미착용자를 발견했는데 어느 부서에 신고해야 하나요?",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": true,
+        "owner": "",
+        "partners": [],
+        "evidenceDocuments": []
+      },
+      "rationale": "route.ts 프롬프트에서 명시적으로 다루는 범위밖 예시(안전).",
+      "reviewNeeded": false
+    },
+    {
+      "id": "oos-002",
+      "category": "out-of-scope",
+      "question": "신입사원 인사평가 기준이 궁금합니다.",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": true,
+        "owner": "",
+        "partners": [],
+        "evidenceDocuments": []
+      },
+      "rationale": "인사 영역, 데모 범위(투자·회계·구매) 밖.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "oos-003",
+      "category": "out-of-scope",
+      "question": "협력사와의 노무 관련 분쟁이 발생했을 때 대응 절차가 궁금합니다.",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": true,
+        "owner": "",
+        "partners": [],
+        "evidenceDocuments": []
+      },
+      "rationale": "노무 영역, 범위 밖.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "org-001",
+      "category": "org-chart-only",
+      "question": "우리 회사 조직도에서 경영기획실 산하 부서 목록을 확인하고 싶습니다.",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": true,
+        "owner": "",
+        "partners": [],
+        "evidenceDocuments": ["조직 및 책임권한 규정"]
+      },
+      "rationale": "확정: 실제 조직도 관리 주체는 인사문화그룹(pilot_departments.json)이지만, 이 앱은 SCOPE_CATEGORIES를 투자·공사/재무·회계/구매·자재로 명시적으로 한정하는 설계(route.ts:20-37)이고 인사문화그룹은 화이트리스트에도 없음. 따라서 조직도 열람 질문은 설계상 범위 밖 - needsMoreInfo:true가 정답.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "under-001",
+      "category": "underspecified",
+      "question": "설비를 새로 구매하려고 하는데 어떻게 진행하면 되나요?",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": true,
+        "owner": "",
+        "partners": [],
+        "evidenceDocuments": []
+      },
+      "rationale": "금액 미기재 - 5억 기준으로 owner(투자관리그룹 vs 설비자재구매그룹)가 갈리므로 이상적으로는 needsMoreInfo:true(금액 확인 요청)가 정답. (미확정 사유: 이건 도메인 지식이 아니라 런타임 동작 문제 - route.ts의 관련성 임계값(0.4) 로직상 '설비'·'구매' 키워드만으로도 설비자재구매그룹 청크가 임계값을 넘어 자동으로 owner가 채워질 가능성이 있음. 실제로 API를 호출해봐야 확정되고, 이 결과 자체가 '금액 없는 질문에 함부로 단정하는' 검색 품질 문제를 드러내는 좋은 테스트 케이스임)",
+      "reviewNeeded": true
+    },
+    {
+      "id": "under-002",
+      "category": "underspecified",
+      "question": "설비 투자 관련해서 문의드립니다.",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": true,
+        "owner": "",
+        "partners": [],
+        "evidenceDocuments": []
+      },
+      "rationale": "질문이 너무 포괄적 - 근거 문서를 특정할 정보가 부족. (미확정 사유: under-001과 동일하게 런타임 임베딩 점수에 좌우되는 케이스라 실제 API 호출로만 확정 가능)",
+      "reviewNeeded": true
+    },
+    {
+      "id": "inv-006",
+      "category": "clear-in-scope",
+      "question": "설비 투자 실무급협의회와 투자심의회는 어떤 부서가 주관하며 어떤 순서로 진행되나요?",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "투자관리그룹",
+        "partners": [],
+        "evidenceDocuments": ["타당성 평가 및 심의 지침"]
+      },
+      "rationale": "확정: 투자관리그룹 지침 6.2절(Activity 20: 투자심의회 주관) 전체가 투자관리그룹 소관으로 서술되어 있고 다른 부서 언급이 없음. 절차 자체를 묻는 질문이라 partners 없음.",
+      "reviewNeeded": false
+    },
+    {
+      "id": "proc-003",
+      "category": "procurement-focus",
+      "question": "설비자재 계약 시 수의계약이 가능한 조건이 궁금합니다.",
+      "site": null,
+      "expected": {
+        "needsMoreInfo": false,
+        "owner": "설비자재구매그룹",
+        "partners": [],
+        "evidenceDocuments": ["구매관리규정"]
+      },
+      "rationale": "확정: 구매관리규정 제8조①에 수의 방식이 4가지 계약방식 중 하나로 명시되어 있고 설비자재구매그룹(계약담당자) 소관. 정도경영그룹의 수의계약 사전감사 역할은 pilot_departments.json(조직도 데이터)에만 있고 이 파일은 벡터 검색 대상이 아니라 화이트리스트 필터링에만 쓰이므로 애초에 검색 결과로 등장할 수 없음 - route.ts의 allowedSet 필터가 화이트리스트 밖 부서를 실제로 걸러내는지 확인하는 스트레스 테스트 케이스.",
+      "reviewNeeded": false
+    }
+  ]
+}
