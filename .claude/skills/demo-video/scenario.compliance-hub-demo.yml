@@ -1,101 +1,128 @@
-# 약 60초 본편 데모 — Compliance Hub까지 포함 (결과보고서 첨부용)
+# 60초 이내 본편 데모 — Compliance Hub까지 포함 (결과보고서 첨부용)
 # 오프닝 카드 + 챕터 4개(검색/결과확인/메일전송/진행현황) + 엔딩 카드(Compliance Hub)
+#
+# 2026-09-12 업데이트: RAG 응답 모델이 gpt-4o-mini -> gpt-5.6-luna로 바뀌며 응답이
+# 느려졌고(실측 약 20초), RagPanel에 새 "이 추천으로 협업 요청 준비" 버튼이 추가되며 기존
+# ".draft-button" 클래스가 두 곳(RAG 패널 / 규칙 기반 카드)에서 중복돼 셀렉터가 더 이상
+# 유일하지 않게 되었습니다. reference/page.tsx에 data-testid를 추가해 두 버튼과 부서별
+# 체크박스를 명확히 구분하고, 이 시나리오는 규칙 기반 카드 쪽 버튼(rule-draft-button)을
+# 사용합니다.
+#
+# 2026-09-12 2차 업데이트: 60초 목표를 넘긴 주범은 LLM 응답 대기(실측 ~20초)였습니다.
+# 실제 대기 시간을 줄일 수는 없으므로(백엔드 호출), `mark`로 대기 구간의 시작/끝 시각을
+# 기록해 두고 demo-video.mjs가 녹화 후 그 구간만 time-lapse(배속)로 압축합니다(아래
+# speedSegments). 로딩 문구("지침 문서를 검색하고 근거를 확인하는 중입니다…")가 화면에
+# 그대로 보이는 채로 빠르게 지나가고, 그 외 모든 구간은 정상 속도를 유지합니다.
 url: http://localhost:3100
 output: out/department-workflow-demo-compliance-hub.mp4
+
+speedSegments:
+  - from: ragWaitStart
+    to: ragWaitEnd
+    target: 1.0 # seconds shown, regardless of actual LLM latency
 
 chapters:
   # 오프닝 카드
   - title: 업무 지침 네비게이터
     subtitle: 업무 상황을 입력하면 절차와 협업부서를 안내하고 이메일로 요청까지 이어집니다
     steps:
-      - wait: 1800
+      - wait: 700
         caption: 업무 지침 네비게이터에 접속합니다
       - move:
           selector: '#question'
-      - wait: 700
+      - wait: 200
 
   - title: 1. 업무 상황 검색
     subtitle: 질문을 입력하면 관련 절차와 담당부서를 찾아드립니다
     steps:
       - highlight:
           selector: '#question'
-          duration: 900
+          duration: 700
           caption: 업무 상황을 입력합니다
       - type:
           selector: '#question'
           text: 5억 원 이상 설비 투자를 검토할 때 사전에 협의해야 할 부서와 절차를 알려주세요.
-          delay: 50
+          delay: 30
       - click:
           selector: 'button:has-text("부서 찾기")'
           caption: 부서 찾기를 눌러 검색합니다
-      - wait: 1500
+      - mark: ragWaitStart
 
   - title: 2. 결과 확인 및 부서 선택
     subtitle: RAG 근거로 추천 부서를 확인하고 협업 요청 대상을 고릅니다
     steps:
+      # move()가 .rag-panel이 나타날 때까지 기다립니다(최대 45초, LLM 호출이라 보통
+      # 10~20초). 녹화 후 ragWaitStart~ragWaitEnd 구간만 별도로 배속 처리되므로 여기서는
+      # 고정 대기를 넣지 않습니다 - 실제로 얼마나 걸리든 최종 영상엔 짧게만 보입니다.
+      - move:
+          selector: '.rag-panel'
+      - mark: ragWaitEnd
       - highlight:
           selector: '.rag-panel'
-          duration: 1100
-          caption: 추천 부서와 협업 부서를 확인합니다
-      - wait: 500
+          duration: 900
+          caption: LangChain RAG 근거로 추천 부서와 협업 부서를 확인합니다
+      - wait: 200
       - scroll:
           selector: '.result-grid'
-          duration: 800
+          duration: 500
           caption: 비교용 추천 결과로 이동합니다
       - click:
-          selector: 'article.department-card:has-text("투자관리그룹") input[type="checkbox"]'
+          selector: '[data-testid="department-checkbox-investment"]'
           caption: 투자관리그룹을 협업 부서로 선택합니다
       - click:
-          selector: 'article.department-card:has-text("설비자재구매그룹") input[type="checkbox"]'
+          selector: '[data-testid="department-checkbox-equipment-material"]'
           caption: 설비자재구매그룹도 추가로 선택합니다
       - click:
-          selector: '.draft-button'
+          selector: '[data-testid="rule-draft-button"]'
           caption: 검토 요청 내용 준비를 클릭합니다
-      - wait: 700
+      - wait: 300
       - click:
           selector: '.confirmation-actions button:not(.secondary)'
           caption: 요청 내용을 확인하고 저장합니다
-      - wait: 900
+      - wait: 400
 
   - title: 3. 협업 요청 메일 전송
     subtitle: 자동 정리된 요청 사항을 담당부서에 전송합니다
     steps:
       - scroll:
           selector: '.draft'
-          duration: 900
+          duration: 500
           caption: 메일 초안 화면으로 이동합니다
       - expand:
           selector: '.draft textarea[aria-label="검토 요청 초안"]'
       - highlight:
           selector: '.draft textarea[aria-label="검토 요청 초안"]'
-          duration: 1600
+          duration: 800
           caption: 요청 사항이 자동으로 정리됩니다
       - scroll:
           selector: '.send-button'
-          duration: 700
+          duration: 300
       - click:
           selector: '.send-button'
           caption: 메일 보내기를 눌러 검토를 요청합니다
-      - wait: 1800
+      - wait: 600
 
   - title: 4. 협업 진행 현황 관리
     subtitle: 메일 발송부터 회신 완료까지 진행 상태를 한 화면에서 확인합니다
     steps:
+      # 화면 중앙에 오도록 스크롤해 카드 전체(상태 배지·4단계 진행바·버튼)가 잘리지 않고
+      # 한 번에 보이게 합니다.
       - scroll:
           selector: '.request-tracker'
-          duration: 900
+          duration: 600
+          align: center
+          caption: 업무 요청 완료 현황을 확인합니다
       - highlight:
           selector: '.request-tracker'
-          duration: 1200
-          caption: 업무 요청 완료 현황을 확인합니다
+          duration: 700
       - click:
           selector: '.reply-tab'
           caption: 담당부서 접수 확인 · 검토중으로 변경합니다
-      - wait: 1000
+      - wait: 400
       - click:
           selector: '.reply-tab'
           caption: 현업 담당자 확인 후 회신 완료로 변경합니다
-      - wait: 1300
+      - wait: 500
 
   # 엔딩 카드
   - title: Compliance Hub
@@ -104,19 +131,19 @@ chapters:
       - click:
           selector: 'nav.nav-links a:has-text("Compliance Hub")'
           caption: Compliance Hub로 이동합니다
-      - wait: 800
+      - wait: 300
       - scroll:
           selector: '.document-list'
-          duration: 800
+          duration: 400
           caption: 참고 문서 목록을 확인합니다
       - highlight:
           selector: '.document-list'
-          duration: 900
+          duration: 400
       - scroll:
           selector: '.request-log'
-          duration: 800
+          duration: 400
           caption: 협업 요청 이력을 확인합니다
       - highlight:
           selector: '.request-log'
-          duration: 1400
-      - wait: 1000
+          duration: 700
+      - wait: 300
