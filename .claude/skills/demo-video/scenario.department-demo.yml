@@ -1,6 +1,12 @@
-# 약 60초 본편 + 10초 채팅용 GIF 설정
+# 60초 이내 본편 + 10초 채팅용 GIF 설정
+# RAG(LLM) 호출은 실제로 10~20초 걸리므로, 그 대기 구간만 speedSegments로 타임랩스 처리해
+# 전체 영상이 60초를 넘기지 않도록 한다 (mark: rag-wait-start/end 사이 구간).
 url: http://localhost:3000
 output: out/department-workflow-demo.mp4
+speedSegments:
+  - from: rag-wait-start
+    to: rag-wait-end
+    target: 2.5
 gif:
   enabled: true
   output: out/department-workflow-chat.gif
@@ -13,39 +19,52 @@ chapters:
   - title: 업무 지침 네비게이터
     subtitle: 업무 상황을 입력하면 절차와 협업부서를 안내하고 이메일로 요청까지 이어집니다
     steps:
-      - wait: 1800
+      - wait: 900
         caption: 업무 지침 네비게이터에 접속합니다
       - move:
           selector: '#question'
-      - wait: 700
+      - wait: 300
 
   - title: 1. 업무 상황 검색
     subtitle: 질문을 입력하면 관련 절차와 담당부서를 찾아드립니다
     steps:
       - highlight:
           selector: '#question'
-          duration: 900
+          duration: 700
           caption: 업무 상황을 입력합니다
       - type:
           selector: '#question'
           text: 5억 원 이상 설비 투자를 검토할 때 사전에 협의해야 할 부서와 절차를 알려주세요.
-          delay: 50
+          delay: 40
       - click:
           selector: 'button:has-text("부서 찾기")'
           caption: 부서 찾기를 눌러 검색합니다
-      - wait: 2200
 
   - title: 2. 결과 확인 및 부서 선택
     subtitle: RAG 근거로 추천 부서를 확인하고 협업 요청 대상을 고릅니다
     steps:
+      # RAG(LLM) 응답은 실제로 10~20초 걸린다. 이 챕터 타이틀 카드가 뜬 "다음"에 기다려야
+      # 화면에 "2. 결과 확인 및 부서 선택"이 결과 화면보다 먼저 보인다 - 이 대기를 챕터 1
+      # 끝에 두면 타이틀 카드가 뜨기도 전에 결과 화면이 이미 로딩되는 게 녹화된다.
+      - mark: rag-wait-start
+      - move:
+          selector: '.rag-panel'
+      - mark: rag-wait-end
+      - scroll:
+          selector: '.query-summary'
+          duration: 500
+      - highlight:
+          selector: '.query-summary'
+          duration: 1200
+          caption: 입력한 업무 상황이 화면 상단에 계속 표시됩니다
       - highlight:
           selector: '.rag-panel'
-          duration: 1400
+          duration: 1300
           caption: LangChain RAG 근거로 추천 부서와 협업 부서를 확인합니다
-      - wait: 900
+      - wait: 300
       - scroll:
           selector: '.result-grid'
-          duration: 800
+          duration: 600
           caption: 비교용 추천 결과로 이동합니다
       - click:
           selector: 'article.department-card:has-text("투자관리그룹") input[type="checkbox"]'
@@ -54,52 +73,72 @@ chapters:
           selector: 'article.department-card:has-text("설비자재구매그룹") input[type="checkbox"]'
           caption: 설비자재구매그룹도 추가로 선택합니다
       - click:
-          selector: '.draft-button'
+          selector: '[data-testid="rule-draft-button"]'
           caption: 검토 요청 내용 준비를 클릭합니다
-      - wait: 700
+      - wait: 400
       - click:
           selector: '.confirmation-actions button:not(.secondary)'
           caption: 요청 내용을 확인하고 저장합니다
-      - wait: 900
+      - wait: 500
 
   - title: 3. 협업 요청 메일 전송
     subtitle: 자동 정리된 요청 사항을 담당부서에 전송합니다
     steps:
       - scroll:
           selector: '.draft'
-          duration: 900
+          duration: 600
           caption: 메일 초안 화면으로 이동합니다
       - expand:
           selector: '.draft textarea[aria-label="검토 요청 초안"]'
       - highlight:
           selector: '.draft textarea[aria-label="검토 요청 초안"]'
-          duration: 1800
+          duration: 1300
           caption: 요청 사항 1~4번까지 자동으로 정리됩니다
       - scroll:
           selector: '.send-button'
-          duration: 700
+          duration: 500
       - click:
           selector: '.send-button'
           caption: 메일 보내기를 눌러 검토를 요청합니다
-      - wait: 1800
+      - wait: 600
 
   # 엔딩 카드
   - title: 업무 요청 완료
     subtitle: 근거 확인부터 이메일 요청과 회신 상태까지 한 흐름으로 관리
     steps:
-      - wait: 1400
+      - wait: 700
       - scroll:
           selector: '.request-tracker'
-          duration: 900
+          duration: 600
       - highlight:
           selector: '.request-tracker'
-          duration: 1100
+          duration: 800
           caption: 현업 확인 현황을 확인합니다
       - click:
           selector: '.reply-tab'
           caption: 담당부서 접수 확인 · 검토중으로 변경합니다
-      - wait: 1100
+      - wait: 600
       - click:
           selector: '.reply-tab'
           caption: 현업 담당자 확인 후 회신 완료로 변경합니다
-      - wait: 1500
+      - wait: 400
+
+  - title: Compliance Hub
+    subtitle: 참고 문서와 협업 요청 이력을 한 곳에서 관리합니다
+    steps:
+      - click:
+          selector: 'a:has-text("Compliance Hub")'
+          caption: Compliance Hub 메뉴로 이동합니다
+      - wait: 500
+      - highlight:
+          selector: '.compliance-panel:has-text("참고 문서")'
+          duration: 1100
+          caption: 사내 규정·업무분장 참고 문서를 확인할 수 있습니다
+      - scroll:
+          selector: '.compliance-panel:has-text("요청 이력")'
+          duration: 600
+      - highlight:
+          selector: '.request-log-wrap'
+          duration: 1150
+          caption: 방금 보낸 협업 요청이 이력에 자동으로 기록됩니다
+      - wait: 400
