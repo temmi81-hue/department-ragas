@@ -8,7 +8,7 @@ type Workflow = { id: string; title: string; keywords: string[]; threshold: stri
 type RagResult = { needsMoreInfo: boolean; owner: string; partners: string[]; reason: string; evidence: { quote: string; source: string }[]; retrieved: { content: string; document?: string; department?: string; workType?: string }[] };
 type ReferenceDocument = { document: string; department: string; workType: string };
 type RequestStatus = '작성중' | '검토 대기' | '검토중' | '회신 완료';
-type RequestLogEntry = { id: string; createdAt: string; question: string; site: string; category: string; owner: string; partners: string[]; status: RequestStatus };
+type RequestLogEntry = { id: string; createdAt: string; question: string; site: string; category: string; owner: string; partners: string[]; status: RequestStatus; sentAt: string | null };
 const MAIL_DOMAIN = process.env.NEXT_PUBLIC_MAIL_DOMAIN ?? 'example.invalid';
 
 const sites = ['미선택', '포항', '광양', '세종', '전사'];
@@ -80,18 +80,27 @@ export default function Home() {
     const evidenceText = rag.evidence.length ? rag.evidence.map((item) => `- ${item.quote} (${item.source})`).join('\n') : rag.reason;
     setDraft(`수신: ${recipientLines}\n제목: [사전 협의 요청] ${ownerDept.name} 관련 업무 검토\n\n업무 상황\n${question}\n\n사업장: ${site === '미선택' ? '미입력' : site}\n요청 사항\n${buildRequestItems(recipients.length)}\n\nAI(LangChain RAG) 추천 근거\n${rag.reason}\n${evidenceText}`);
   }
-  async function sendMail() { setMailSending(true); setMailError(''); try { const subject = draft.split('\n').find((line) => line.startsWith('제목:'))?.replace(/^제목:\s*/, '') ?? '사전 협의 요청'; const recipients = selectedDepartments.map(departmentEmail); const response = await fetch('/api/mail', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subject, text: draft, recipients }) }); const contentType = response.headers.get('content-type') ?? ''; const data = contentType.includes('application/json') ? await response.json() : { error: `메일 서버가 정상 응답을 반환하지 않았습니다. (HTTP ${response.status})` }; if (!response.ok) throw new Error(data.error); setRequestStatus('검토 대기'); void logRequest(recipients); } catch (mailSendError) { setMailError(mailSendError instanceof Error ? mailSendError.message : '메일 발송에 실패했습니다.'); } finally { setMailSending(false); } }
-  // 메일 발송이 성공한 시점에만 Compliance Hub 이력에 한 건을 남깁니다. RAG가 확정한 owner/partners가
-  // 있으면 그것을, 없으면(추가 확인 필요 등) 화면에 이미 보여준 규칙 기반 후보를 그대로 기록합니다.
-  async function logRequest(recipients: string[]) {
+  // [서버 가드 1/2] 발송 전에 먼저 이 요청을 서버에 등록해 "확인됨" 기록(subject·text·recipients
+  // 포함)을 남깁니다. RAG가 확정한 owner/partners가 있으면 그것을, 없으면(추가 확인 필요 등)
+  // 화면에 이미 보여준 규칙 기반 후보를 그대로 기록합니다. 등록에 실패하면 발송을 시도하지 않습니다.
+  async function registerRequest(recipients: string[], subject: string, text: string): Promise<string | null> {
     const owner = rag && !rag.needsMoreInfo ? rag.owner : primary?.name ?? '';
     const partners = rag && !rag.needsMoreInfo ? rag.partners : results.slice(1, 4).map((item) => item.name);
     try {
-      const response = await fetch('/api/requests', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question, site, category, owner, partners, recipients }) });
+      const response = await fetch('/api/requests', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question, site, category, owner, partners, recipients, subject, text }) });
       const data = await response.json();
-      if (response.ok) setRequestId(data.entry.id);
-    } catch { /* 이력 저장 실패는 메일 발송 결과에 영향 주지 않음 */ }
+      if (!response.ok) throw new Error(data.error);
+      setRequestId(data.entry.id);
+      return data.entry.id as string;
+    } catch (registerError) {
+      setMailError(registerError instanceof Error ? registerError.message : '검토 요청 등록에 실패했습니다.');
+      return null;
+    }
   }
+  // [서버 가드 2/2] 발송은 등록으로 받은 requestId로만 요청합니다 — 제목·본문·수신자를 여기서
+  // 다시 보내지 않습니다. /api/mail은 이 id로 등록된 내용이 없거나 이미 발송된 요청이면
+  // 아무것도 보내지 않으므로, 화면을 거치지 않고 /api/mail을 직접 호출해도 발송되지 않습니다.
+  async function sendMail() { setMailSending(true); setMailError(''); try { const subject = draft.split('\n').find((line) => line.startsWith('제목:'))?.replace(/^제목:\s*/, '') ?? '사전 협의 요청'; const recipients = selectedDepartments.map(departmentEmail); const id = await registerRequest(recipients, subject, draft); if (!id) return; const response = await fetch('/api/mail', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ requestId: id }) }); const contentType = response.headers.get('content-type') ?? ''; const data = contentType.includes('application/json') ? await response.json() : { error: `메일 서버가 정상 응답을 반환하지 않았습니다. (HTTP ${response.status})` }; if (!response.ok) throw new Error(data.error); setRequestStatus('검토 대기'); } catch (mailSendError) { setMailError(mailSendError instanceof Error ? mailSendError.message : '메일 발송에 실패했습니다.'); } finally { setMailSending(false); } }
   async function updateRequestStatus(status: '검토중' | '회신 완료') {
     setRequestStatus(status);
     if (!requestId) return;
@@ -140,7 +149,11 @@ function ComplianceHub({ documents, entries }: { documents: ReferenceDocument[];
     <div className="compliance-panel">
       <h3>협업 요청 이력</h3>
       {entries.length
-        ? <div className="request-log-wrap"><table className="request-log"><thead><tr><th>요청 시각</th><th>업무 상황</th><th>주관 부서</th><th>협업 부서</th><th>상태</th></tr></thead><tbody>{entries.map((entry) => <tr key={entry.id}><td>{new Date(entry.createdAt).toLocaleString('ko-KR')}</td><td>{entry.question}</td><td>{entry.owner || '미확정'}</td><td>{entry.partners.length ? entry.partners.join(', ') : '-'}</td><td><span className={`status-pill ${entry.status === '회신 완료' ? 'done' : 'waiting'}`}>{entry.status}</span></td></tr>)}</tbody></table></div>
+        // sentAt이 명시적으로 null이면 서버 등록만 되고 실제 발송(/api/mail)은 아직 안 된
+        // 상태입니다 — 이 경우만 "발송 대기"로 따로 표시합니다. sentAt 필드가 아예 없는
+        // 레거시 이력(이 가드를 넣기 전에는 발송 성공 시에만 기록됐음)은 이미 발송된
+        // 것이므로 저장된 status를 그대로 보여줍니다.
+        ? <div className="request-log-wrap"><table className="request-log"><thead><tr><th>요청 시각</th><th>업무 상황</th><th>주관 부서</th><th>협업 부서</th><th>상태</th></tr></thead><tbody>{entries.map((entry) => { const label = entry.sentAt === null ? '발송 대기' : entry.status; return <tr key={entry.id}><td>{new Date(entry.createdAt).toLocaleString('ko-KR')}</td><td>{entry.question}</td><td>{entry.owner || '미확정'}</td><td>{entry.partners.length ? entry.partners.join(', ') : '-'}</td><td><span className={`status-pill ${label === '회신 완료' ? 'done' : 'waiting'}`}>{label}</span></td></tr>; })}</tbody></table></div>
         : <p className="message notice">아직 접수된 협업 요청이 없습니다. 검토 요청 메일을 보내면 이곳에 기록됩니다.</p>}
     </div>
   </section>;
