@@ -5,6 +5,7 @@ import { ChatOpenAI, OpenAIEmbeddings } from '@langchain/openai';
 import { MemoryVectorStore } from 'langchain/vectorstores/memory';
 import { DocxLoader } from '@langchain/community/document_loaders/fs/docx';
 import { traceable } from 'langsmith/traceable';
+import { StateGraph, Annotation, START, END } from '@langchain/langgraph';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -129,156 +130,291 @@ async function getAllowedDepartments() {
   return allowedDepartmentsPromise;
 }
 
+function getChatModel() {
+  // [3차 개선] gpt-4o-mini -> GPT-5.6 Luna로 기본 모델 교체. 골든셋 19건 재평가에서
+  // 코드/프롬프트 변경 없이 모델만 바꿨는데 주관부서 매칭 정확도가 79%->95%로 크게
+  // 오른 것을 확인해 기본값으로 채택했습니다(단, 응답속도는 약 2배 느려짐 - 라이브 데모 시 참고).
+  // RAG_CHAT_MODEL 환경변수로 다른 모델(예: 'gpt-4o-mini')로 되돌릴 수 있습니다.
+  // o-시리즈/GPT-5 계열 "추론 모델"은 temperature 파라미터 자체를 지원하지 않아(실제 호출 시
+  // "temperature does not support 0" 400 에러 확인) 조건부로 뺍니다.
+  const CHAT_MODEL = process.env.RAG_CHAT_MODEL ?? 'gpt-5.6-luna';
+  const isReasoningModel = /^(o\d|gpt-5)/i.test(CHAT_MODEL);
+  return new ChatOpenAI(isReasoningModel ? { model: CHAT_MODEL } : { model: CHAT_MODEL, temperature: 0 });
+}
+
+type PrimaryRelevanceEntry = { department: string; score: number; docs: Document[] };
+type Evidence = { quote: string; source: string };
+
+// 부서별 "최고 유사도 점수"가 임계값을 넘는 항목만 남겨 점수 내림차순으로 정렬합니다.
+// judge/reReview 두 노드 모두 이 정렬 기준으로 "1위/2위 후보"를 판단하므로 공용 함수로 뺐습니다.
+function computeRelevantPrimary(primaryRelevance: PrimaryRelevanceEntry[]) {
+  return primaryRelevance
+    .filter((entry) => entry.docs.length > 0)
+    .sort((a, b) => b.score - a.score);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// [4단계 개선] 그래프 기반 "애매한 경계 사례 재검토" 노드
+//
+// 기존(3단계까지) 로직은 검색 → 판정이 한 번에 끝나는 단선 흐름이었습니다. 1위-2위
+// 부서의 유사도 점수 격차가 좁은(RELEVANCE_MARGIN 미만) "애매한 경계 사례"는 LLM의
+// 1차 판단을 그대로 신뢰할 수밖에 없었고, 코드 주석에도 "다음 단계에서는 검색 방식
+// 자체(재순위화 등) 개선이 필요하다"고 남겨져 있었습니다(향후 계획 슬라이드의
+// "Reranking" 항목이 바로 이 부분입니다).
+//
+// 이번에 LangGraph의 StateGraph로 이 부분을 명시적인 조건부 분기로 만들었습니다:
+// judge 노드가 "1위가 뚜렷하다(hasDominantWinner)"고 판단하면 그대로 끝내고,
+// 애매하면 reReview 노드로 넘어가 상위 2개 후보의 근거만 다시 좁혀 비교하는
+// 별도 LLM 호출(2차 판단)을 한 번 더 실행합니다. LangSmith 트레이스에도 이 두 노드가
+// 별도 단계로 찍혀, 애매한 사례에서 실제로 재검토가 실행됐는지 확인할 수 있습니다.
+// ─────────────────────────────────────────────────────────────────────────
+
+const RagAnnotation = Annotation.Root({
+  question: Annotation<string>(),
+  site: Annotation<string | undefined>(),
+  category: Annotation<string | undefined>(),
+  queryText: Annotation<string>(),
+  allowedDepartments: Annotation<string[]>(),
+  primaryRelevance: Annotation<PrimaryRelevanceEntry[]>(),
+  docs: Annotation<Document[]>(),
+  context: Annotation<string>(),
+  owner: Annotation<string>(),
+  partners: Annotation<string[]>(),
+  needsMoreInfo: Annotation<boolean>(),
+  reason: Annotation<string>(),
+  evidence: Annotation<Evidence[]>(),
+  hasDominantWinner: Annotation<boolean>(),
+  declinedWithSpecificReason: Annotation<boolean>(),
+  resolvedByAmountRule: Annotation<boolean>(),
+  reReviewed: Annotation<boolean>(),
+});
+
+type RagState = typeof RagAnnotation.State;
+
+// 1) 검색 노드: 기존 임베딩 검색 로직 그대로(부서별 최고 점수가 임계값을 넘을 때만
+// 해당 부서 문서를 통째로 포함 + 조직도 보충 문서 추가) — 3단계까지와 동일합니다.
+async function retrieveNode(state: RagState): Promise<Partial<RagState>> {
+  const store = await getStore();
+  const allowedDepartments = await getAllowedDepartments();
+  const UNSET_FILTER_VALUES = new Set(['미선택', '자동 분류']);
+  const queryParts = [state.question, state.site, state.category].filter(
+    (part): part is string => typeof part === 'string' && part.length > 0 && !UNSET_FILTER_VALUES.has(part)
+  );
+  const queryText = queryParts.join(' / ');
+  const topK = Number(process.env.RAG_TOP_K ?? 6);
+  const SUPPLEMENTARY_DEPARTMENT = '전사 조직';
+  const primaryDepartments = SCOPE_DEPARTMENTS.filter((department) => department !== SUPPLEMENTARY_DEPARTMENT);
+  const RELEVANCE_THRESHOLD = 0.4;
+  const primaryRelevance = await Promise.all(
+    primaryDepartments.map(async (department) => {
+      const scored = await store.similaritySearchWithScore(queryText, 1, (doc) => doc.metadata.department === department);
+      const score = scored.length ? scored[0][1] : 0;
+      const docs = score >= RELEVANCE_THRESHOLD
+        ? store.memoryVectors
+            .filter((vector) => vector.metadata.department === department)
+            .map((vector) => new Document({ pageContent: vector.content, metadata: vector.metadata }))
+        : [];
+      return { department, score, docs };
+    })
+  );
+  if (process.env.RAG_DEBUG_SCORES === 'true') {
+    const ranked = [...primaryRelevance].sort((a, b) => b.score - a.score)
+      .map((e) => `${e.department}:${e.score.toFixed(4)}`).join('  ');
+    console.log(`[relevance] "${state.question}" ->`, ranked);
+  }
+  const primaryDocs = primaryRelevance.flatMap((entry) => entry.docs);
+  const orgChartDocs = await store.similaritySearch(
+    queryText,
+    Math.max(1, topK - primaryDocs.length),
+    (doc) => doc.metadata.department === SUPPLEMENTARY_DEPARTMENT
+  );
+  const docs = [...primaryDocs, ...orgChartDocs];
+  const context = docs.map((doc, index) => `[근거 ${index + 1}] ${doc.pageContent}\n출처: ${doc.metadata.document}\n부서: ${doc.metadata.department}\n업무 유형: ${doc.metadata.workType}`).join('\n\n');
+  return { queryText, allowedDepartments, primaryRelevance, docs, context };
+}
+
+// 2) 판정 노드: 기존 1차 LLM 판정 + 화이트리스트 검증 + "뚜렷한 1위" 자동 매칭 로직 —
+// 3단계까지와 동일합니다. 다만 여기서 끝내지 않고 hasDominantWinner를 함께 반환해
+// 그래프가 다음에 finalize로 갈지 reReview로 갈지 결정하게 합니다.
+async function judgeNode(state: RagState): Promise<Partial<RagState>> {
+  const model = getChatModel();
+  const response = await model.invoke([
+    ['system', [
+      '당신은 사내 업무분장 안내 도우미입니다. 이 데모는 투자·공사, 재무·회계, 설비·자재 구매 관련 업무만 다룹니다. 제공된 근거만 사용하세요.',
+      `owner와 partners는 반드시 다음 부서 목록 중에서만 선택하세요: ${state.allowedDepartments.join(', ')}. 목록에 없는 부서명은 절대 만들어내지 마세요.`,
+      '질문이 투자·공사, 재무·회계, 설비·자재 구매와 무관하거나(예: 안전·인사 등), 근거에 목록 안의 부서가 명확히 나오지 않으면 owner를 빈 문자열로 두고 needsMoreInfo를 true로 하여 reason에 "투자·회계·구매 관련 업무가 아니거나 추가 확인이 필요합니다"라고 답하세요. 부서를 추측하지 마세요.',
+      'partners(협업 부서)는 질문이 실제로 묻는 절차 단계와 직접 관련된 부서만 포함하세요. 근거 문서에 같은 표(R&R 표 등)에 나열되어 있다는 이유만으로 무관한 단계의 부서를 넣지 마세요 - 예를 들어 질문이 회계처리(자산등록·감가상각)만 묻는다면 구매 실행이나 투자심의 단계 부서는 partners에 넣지 마세요. 질문이 여러 단계(투자심의~구매~회계처리)를 함께 묻거나 전체 절차를 묻는 경우에만 관련된 여러 부서를 partners에 포함하세요. owner와 동일한 부서는 partners에 절대 중복 포함하지 마세요.',
+      '여러 부서가 근거에 함께 등장하고 그중 일정 금액 기준(예: 5억원) 이상 여부를 심의·승인하는 절차(투자심의회 등)를 주관하는 부서가 있다면, 그 심의 주관 부서를 owner로 선택하고 나머지(구매 실행, 회계처리 등 후속 업무를 담당하는 부서)는 partners에 포함하세요. 심의 절차 없이 실행·처리 업무만 언급된 경우에는 그 실행 부서를 owner로 선택하세요.',
+      '아래 human 메시지의 "금액 판정"은 서버가 이미 계산해 둔 사실입니다. 금액 판정은 "설비·장비를 신규로 구매/도입할지 결정하는 단계"에서 투자심의 대상 여부(owner가 투자관리그룹인지 설비자재구매그룹인지)를 가릴 때만 사용하세요 - 이 경우 질문 속 금액을 스스로 다시 읽고 5억원과 비교하지 말고 판정을 그대로 따르세요: "5억원 이상"이면 심의 주관 부서(예: 투자관리그룹)를 owner로, "미달"이면 실행 부서(예: 설비자재구매그룹)를 owner로 선택하고 needsMoreInfo는 false로 하세요(미달은 범위 밖이 아니라 내부 승인 대상입니다). 이 경우에 한해 판정이 "특정할 수 없습니다"이면 부서를 추측하지 말고 owner를 빈 문자열로, needsMoreInfo를 true로 하여 reason에 금액 확인이 필요하다고 답하세요. 반대로 질문이 이미 구매 이후의 특정 절차(공급사 선정, 계약 체결, 검수·대금지급, 수의계약, 자산등록, 결산 등)를 묻고 있다면 애초에 금액과 무관하게 owner가 정해지므로, 금액 판정이 "특정할 수 없습니다"여도 owner를 비우지 말고 해당 절차를 담당하는 부서로 정상 답변하세요.',
+      'JSON 이외의 글은 출력하지 마세요.'
+    ].join(' ')],
+    ['human', `질문: ${state.question}\n사업장: ${state.site ?? '미선택'}\n업무 유형: ${state.category ?? '자동 분류'}\n금액 판정: ${describeAmountFact(state.question)}\n\n검색 근거:\n${state.context}\n\n다음 JSON 형식으로 답하세요: {"needsMoreInfo": boolean, "owner": string, "partners": string[] (관련 부서를 최대한 근거 안에서 찾아 포함, 정말 없으면만 빈 배열), "reason": string, "evidence": [{"quote": string, "source": string}]}`]
+  ]);
+  const raw = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+  const result = JSON.parse(raw.replace(/^```json\s*|\s*```$/g, '').trim());
+
+  // 화이트리스트 강제 적용: 프롬프트 지시만으로는 가끔 목록 밖 부서명이 섞여 나올 수 있어
+  // (예: 실제 테스트에서 "결산지원조직"처럼 9개 목록에 없는 이름이 partners에 나온 사례 확인),
+  // 응답을 한 번 더 검증해 목록 밖 값은 제거합니다.
+  const allowedSet = new Set(state.allowedDepartments);
+  const ownerAllowed = typeof result.owner === 'string' && allowedSet.has(result.owner);
+  const safeOwner = ownerAllowed ? result.owner : '';
+  const safePartners: string[] = Array.isArray(result.partners)
+    ? result.partners.filter((partner: unknown): partner is string => typeof partner === 'string' && allowedSet.has(partner) && partner !== safeOwner)
+    : [];
+
+  const OUT_OF_SCOPE_BOILERPLATE = '투자·회계·구매 관련 업무가 아니거나 추가 확인이 필요합니다';
+  const declinedWithSpecificReason = !ownerAllowed && result.needsMoreInfo === true
+    && typeof result.reason === 'string' && result.reason.trim().length > 0
+    && !result.reason.includes(OUT_OF_SCOPE_BOILERPLATE);
+
+  const relevantPrimary = computeRelevantPrimary(state.primaryRelevance);
+  const RELEVANCE_MARGIN = 0.05;
+  const hasDominantWinner = relevantPrimary.length === 1
+    || (relevantPrimary.length > 1 && relevantPrimary[0].score - relevantPrimary[1].score >= RELEVANCE_MARGIN);
+
+  let finalOwner = safeOwner;
+  let finalPartners = safePartners;
+  let finalNeedsMoreInfo = ownerAllowed ? result.needsMoreInfo : true;
+  let finalReason = typeof result.reason === 'string' ? result.reason : '';
+
+  // [4단계 개선 - 별도 버그 수정] "8억원짜리 신규 설비" 처럼 금액이 명확히 주어졌고
+  // human 메시지의 "금액 판정"에도 서버가 이미 사실을 못박아 뒀는데도, LLM이 이 사실을
+  // 무시하고 owner를 비운 채 "금액 확인이 필요합니다" 류의 이유로 보류하는 사례를 재현
+  // 확인했습니다(동일 질문 반복 시에도 간헐적으로 재현 - 프롬프트 지시 준수 실패, 온도 0
+  // 이어도 완전히 결정적이지 않은 LLM의 한계). "정확히 얼마인지 알 수 없어" 보류하는 것과
+  // "얼마인지는 알지만 그 판단을 스스로 다시 하려다 실패"하는 것은 다른 문제이므로,
+  // describeAmountFact()가 이미 명확한 판정("이상"/"미만")을 내린 상태에서 LLM의 보류 사유가
+  // 그 판정 자체를 문제 삼는 경우에만(범위밖 판정이나 다른 사유의 보류는 건드리지 않음)
+  // 서버가 이미 계산해 둔 사실로 owner를 직접 확정합니다 - 금액 파싱을 LLM에 맡기지 않은
+  // 기존 원칙(describeAmountFact 자체)과 동일한 접근입니다.
+  const amountFact = describeAmountFact(state.question);
+  const amountIsDetermined = !amountFact.includes('특정할 수 없습니다');
+  const reasonCitesAmountConfusion = /금액/.test(finalReason) && /(확인|특정)/.test(finalReason);
+  let resolvedByAmountRule = false;
+  if (!finalOwner && amountIsDetermined && reasonCitesAmountConfusion) {
+    finalOwner = amountFact.includes('이상') ? '투자관리그룹' : '설비자재구매그룹';
+    finalNeedsMoreInfo = false;
+    finalPartners = safePartners.filter((partner) => partner !== finalOwner);
+    finalReason = `${amountFact} 이 판정에 따라 ${finalOwner}이 담당합니다.`;
+    // 검색 유사도 점수와 무관하게 서버가 이미 확정한 사실이므로, 뒤이어 그래프가
+    // (점수 격차가 좁다는 이유로) reReview 노드로 보내 이 확정을 다시 흔들지 않도록
+    // hasDominantWinner와 동일하게 "확정됨" 신호로 취급합니다.
+    resolvedByAmountRule = true;
+  }
+
+  if (!finalOwner && !declinedWithSpecificReason && hasDominantWinner) {
+    finalOwner = relevantPrimary[0].department;
+    finalNeedsMoreInfo = false;
+    finalPartners = safePartners.filter((partner) => partner !== finalOwner);
+    finalReason = '검색된 지침 근거에서 관련 부서가 확인되어 자동으로 매칭되었습니다.';
+  }
+
+  return {
+    owner: finalOwner,
+    partners: finalPartners,
+    needsMoreInfo: finalNeedsMoreInfo,
+    reason: finalReason,
+    evidence: Array.isArray(result.evidence) ? result.evidence : [],
+    hasDominantWinner,
+    declinedWithSpecificReason,
+    resolvedByAmountRule,
+    reReviewed: false,
+  };
+}
+
+// 3) 재검토 노드 [신규]: judge 노드가 "애매하다"고 판단한 경우(1위-2위 점수 격차가
+// 좁음)에만 실행됩니다. 상위 2개 후보 부서의 근거만 좁혀서 다시 비교시키는 별도
+// LLM 호출로, 애매한 두 후보 중 하나를 더 근거 있게 골라내려는 시도입니다.
+// 재검토로도 확정하지 못하면 judge 노드의 1차 판단을 그대로 유지합니다(회귀 방지 —
+// 이 노드는 기존 결과를 절대 더 나쁘게 만들지 않고, 개선되거나 그대로거나 둘 중 하나입니다).
+async function reReviewNode(state: RagState): Promise<Partial<RagState>> {
+  const relevantPrimary = computeRelevantPrimary(state.primaryRelevance);
+  const candidates = relevantPrimary.slice(0, 2);
+  if (candidates.length < 2) {
+    return { reReviewed: true };
+  }
+
+  const candidateContext = candidates
+    .map((candidate, index) => (
+      `[후보 ${index + 1}: ${candidate.department}] (검색 유사도 점수 ${candidate.score.toFixed(4)})\n`
+      + candidate.docs.map((doc) => doc.pageContent).join('\n---\n')
+    ))
+    .join('\n\n');
+
+  const model = getChatModel();
+  const response = await model.invoke([
+    ['system', [
+      '당신은 사내 업무분장 안내 도우미입니다.',
+      '1차 판단에서 두 후보 부서의 검색 유사도 점수 차이가 근소해(0.05 미만) 어느 부서가 주관인지 확정하기 어려웠습니다.',
+      '아래 두 후보의 근거 문서만 다시 비교해서, 이 업무를 실제로 어느 부서가 주관하는지 하나를 고르세요.',
+      `owner는 다음 중 하나여야 합니다: ${candidates.map((candidate) => candidate.department).join(', ')}. 이 목록에 없는 부서명은 만들지 마세요.`,
+      '근거를 다시 봐도 정말 판단이 불가능하면 owner를 빈 문자열로 하고 needsMoreInfo를 true로 하세요. 애매하다고 아무거나 고르지 마세요.',
+      'JSON 이외의 글은 출력하지 마세요.'
+    ].join(' ')],
+    ['human', `질문: ${state.question}\n금액 판정: ${describeAmountFact(state.question)}\n\n두 후보의 근거:\n${candidateContext}\n\n다음 JSON 형식으로 답하세요: {"owner": string, "reason": string, "needsMoreInfo": boolean}`]
+  ]);
+
+  const raw = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+  let reReviewResult: { owner?: unknown; reason?: unknown; needsMoreInfo?: unknown };
+  try {
+    reReviewResult = JSON.parse(raw.replace(/^```json\s*|\s*```$/g, '').trim());
+  } catch {
+    // 재검토 응답 파싱 실패: 1차 판단을 그대로 유지합니다.
+    return { reReviewed: true };
+  }
+
+  const candidateNames = new Set(candidates.map((candidate) => candidate.department));
+  const reReviewOwner = typeof reReviewResult.owner === 'string' ? reReviewResult.owner : '';
+  const reReviewOwnerValid = candidateNames.has(reReviewOwner);
+
+  if (!reReviewOwnerValid) {
+    // 재검토로도 확정하지 못한 경우: 1차 판단을 그대로 유지하되, 재검토를
+    // 시도했다는 사실만 기록합니다.
+    return { reReviewed: true };
+  }
+
+  const reReviewReason = typeof reReviewResult.reason === 'string' ? reReviewResult.reason : '';
+  return {
+    owner: reReviewOwner,
+    partners: state.partners.filter((partner) => partner !== reReviewOwner),
+    needsMoreInfo: false,
+    reason: `[재검토] 유사도 점수가 근접한 두 후보(${candidates.map((candidate) => candidate.department).join(' vs ')})의 근거를 다시 비교해 판단했습니다. ${reReviewReason}`.trim(),
+    reReviewed: true,
+  };
+}
+
+const ragGraph = new StateGraph(RagAnnotation)
+  .addNode('retrieve', retrieveNode)
+  .addNode('judge', judgeNode)
+  .addNode('reReview', reReviewNode)
+  .addEdge(START, 'retrieve')
+  .addEdge('retrieve', 'judge')
+  .addConditionalEdges('judge', (state: RagState) => (
+    state.hasDominantWinner || state.declinedWithSpecificReason || state.resolvedByAmountRule ? END : 'reReview'
+  ))
+  .addEdge('reReview', END)
+  .compile();
+
 // 이 함수 하나가 질문 접수부터 최종 JSON 응답까지 전체 파이프라인입니다.
 // traceable()로 감싸서 LangSmith에 "질문 → 검색 근거 → 최종 답변"이 하나의
-// 트레이스로 묶여 보이도록 합니다. 내부에서 호출하는 ChatOpenAI.invoke()는
-// LangSmith 트레이싱이 켜져 있으면(LANGSMITH_TRACING=true) 자동으로 이 트레이스의
-// 하위 실행(child run)으로 잡힙니다. LANGSMITH_API_KEY가 없으면 langsmith SDK가
+// 트레이스로 묶여 보이도록 합니다. 내부에서 호출하는 ragGraph.invoke()는 LangGraph
+// StateGraph(LangChain Runnable)라서, LangSmith 트레이싱이 켜져 있으면
+// (LANGSMITH_TRACING=true) retrieve/judge/reReview 각 노드가 이 트레이스의 하위
+// 실행(child run)으로 자동으로 잡힙니다. LANGSMITH_API_KEY가 없으면 langsmith SDK가
 // 아무 것도 전송하지 않고 조용히 통과하므로, 로컬 개발에는 영향이 없습니다.
 const runRagPipeline = traceable(
   async ({ question, site, category }: { question: string; site?: string; category?: string }) => {
-    const store = await getStore();
-    const allowedDepartments = await getAllowedDepartments();
-    // site/category는 UI에서 선택하지 않으면 '미선택'/'자동 분류' placeholder 문자열이 그대로 넘어온다.
-    // 이 값들은 실제 필터가 아니므로 검색 쿼리에 섞으면 임베딩이 오염되어(예: 관련 문서가
-    // top-k에서 밀려남) 정상적으로 근거가 있는 질문도 "추가 확인 필요"로 잘못 판정될 수 있다.
-    const UNSET_FILTER_VALUES = new Set(['미선택', '자동 분류']);
-    const queryParts = [question, site, category].filter(
-      (part): part is string => typeof part === 'string' && part.length > 0 && !UNSET_FILTER_VALUES.has(part)
-    );
-    const queryText = queryParts.join(' / ');
-    const topK = Number(process.env.RAG_TOP_K ?? 6);
-    // 조직도(전사 조직) 문서 하나가 전체 청크의 90% 이상을 차지해서(94/103), 단순 유사도
-    // 검색(top-k든 부서별 분배든 점수순 정렬이든)에 맡기면 근소한 임베딩 점수 차이로 실제
-    // 범위 문서(투자관리그룹 5개, 회계세무그룹 4개 청크뿐)가 통째로 밀리는 현상이 있었습니다
-    // (동일 질문을 반복 호출해도 결과가 들쭉날쭉했음). 반대로 두 문서를 조건 없이 항상 전부
-    // 포함하면, 질문과 무관해도(예: 안전모 미착용) LLM이 매번 눈에 보이는 투자 문서 쪽으로
-    // 답을 만들어내는 문제가 새로 생겼습니다. 그래서 부서별 "최고 유사도 점수"가 최소 기준을
-    // 넘는 경우에만 해당 부서 문서를 통째로 포함합니다: 청크 수가 적어 특정 청크 하나가
-    // 대표성을 갖기 어렵기 때문에, 상위 몇 개가 아니라 부서 전체를 넣거나 아예 뺍니다.
-    const SUPPLEMENTARY_DEPARTMENT = '전사 조직';
-    const primaryDepartments = SCOPE_DEPARTMENTS.filter((department) => department !== SUPPLEMENTARY_DEPARTMENT);
-    const RELEVANCE_THRESHOLD = 0.4;
-    const primaryRelevance = await Promise.all(
-      primaryDepartments.map(async (department) => {
-        const scored = await store.similaritySearchWithScore(queryText, 1, (doc) => doc.metadata.department === department);
-        const score = scored.length ? scored[0][1] : 0;
-        const docs = score >= RELEVANCE_THRESHOLD
-          ? store.memoryVectors
-              .filter((vector) => vector.metadata.department === department)
-              .map((vector) => new Document({ pageContent: vector.content, metadata: vector.metadata }))
-          : [];
-        return { department, score, docs };
-      })
-    );
-    if (process.env.RAG_DEBUG_SCORES === 'true') {
-      const ranked = [...primaryRelevance].sort((a, b) => b.score - a.score)
-        .map((e) => `${e.department}:${e.score.toFixed(4)}`).join('  ');
-      console.log(`[relevance] "${question}" ->`, ranked);
-    }
-    const primaryDocs = primaryRelevance.flatMap((entry) => entry.docs);
-    const orgChartDocs = await store.similaritySearch(
-      queryText,
-      Math.max(1, topK - primaryDocs.length),
-      (doc) => doc.metadata.department === SUPPLEMENTARY_DEPARTMENT
-    );
-    const docs = [...primaryDocs, ...orgChartDocs];
-    const context = docs.map((doc, index) => `[근거 ${index + 1}] ${doc.pageContent}\n출처: ${doc.metadata.document}\n부서: ${doc.metadata.department}\n업무 유형: ${doc.metadata.workType}`).join('\n\n');
-    // [3차 개선] gpt-4o-mini -> GPT-5.6 Luna로 기본 모델 교체. 골든셋 19건 재평가에서
-    // 코드/프롬프트 변경 없이 모델만 바꿨는데 주관부서 매칭 정확도가 79%->95%로 크게
-    // 오른 것을 확인해 기본값으로 채택했습니다(단, 응답속도는 약 2배 느려짐 - 라이브 데모 시 참고).
-    // RAG_CHAT_MODEL 환경변수로 다른 모델(예: 'gpt-4o-mini')로 되돌릴 수 있습니다.
-    // o-시리즈/GPT-5 계열 "추론 모델"은 temperature 파라미터 자체를 지원하지 않아(실제 호출 시
-    // "temperature does not support 0" 400 에러 확인) 조건부로 뺍니다.
-    const CHAT_MODEL = process.env.RAG_CHAT_MODEL ?? 'gpt-5.6-luna';
-    const isReasoningModel = /^(o\d|gpt-5)/i.test(CHAT_MODEL);
-    const model = new ChatOpenAI(
-      isReasoningModel ? { model: CHAT_MODEL } : { model: CHAT_MODEL, temperature: 0 }
-    );
-    const response = await model.invoke([
-      ['system', [
-        '당신은 사내 업무분장 안내 도우미입니다. 이 데모는 투자·공사, 재무·회계, 설비·자재 구매 관련 업무만 다룹니다. 제공된 근거만 사용하세요.',
-        `owner와 partners는 반드시 다음 부서 목록 중에서만 선택하세요: ${allowedDepartments.join(', ')}. 목록에 없는 부서명은 절대 만들어내지 마세요.`,
-        '질문이 투자·공사, 재무·회계, 설비·자재 구매와 무관하거나(예: 안전·인사 등), 근거에 목록 안의 부서가 명확히 나오지 않으면 owner를 빈 문자열로 두고 needsMoreInfo를 true로 하여 reason에 "투자·회계·구매 관련 업무가 아니거나 추가 확인이 필요합니다"라고 답하세요. 부서를 추측하지 마세요.',
-        // [3차 개선 - 원인②] 기존 지시("owner보다 기준을 넓게, 같은 문서에 등장하면 모두 포함")는
-        // 더미 문서들이 서로의 부서명을 인용하는 구조상 거의 모든 질문에서 3개 부서를 통째로
-        // partners에 담게 만들었다(예: 자산등록만 묻는 질문에도 구매·투자 부서까지 포함).
-        // "질문이 실제로 다루는 절차 단계"로 기준을 좁혀 정밀도를 높인다.
-        'partners(협업 부서)는 질문이 실제로 묻는 절차 단계와 직접 관련된 부서만 포함하세요. 근거 문서에 같은 표(R&R 표 등)에 나열되어 있다는 이유만으로 무관한 단계의 부서를 넣지 마세요 - 예를 들어 질문이 회계처리(자산등록·감가상각)만 묻는다면 구매 실행이나 투자심의 단계 부서는 partners에 넣지 마세요. 질문이 여러 단계(투자심의~구매~회계처리)를 함께 묻거나 전체 절차를 묻는 경우에만 관련된 여러 부서를 partners에 포함하세요. owner와 동일한 부서는 partners에 절대 중복 포함하지 마세요.',
-        '여러 부서가 근거에 함께 등장하고 그중 일정 금액 기준(예: 5억원) 이상 여부를 심의·승인하는 절차(투자심의회 등)를 주관하는 부서가 있다면, 그 심의 주관 부서를 owner로 선택하고 나머지(구매 실행, 회계처리 등 후속 업무를 담당하는 부서)는 partners에 포함하세요. 심의 절차 없이 실행·처리 업무만 언급된 경우에는 그 실행 부서를 owner로 선택하세요.',
-        // [3차 개선 - 원인③ 근본 수정] "정확히 5억원" 같은 경계값을 LLM이 직접 계산하게 하면
-        // 같은 질문에도 답이 흔들렸습니다(3차 평가에서 실측). 그래서 서버가 정규식으로 금액을
-        // 미리 계산해 human 메시지의 "금액 판정"으로 사실을 못박아 주입합니다. LLM은 그 판정을
-        // 그대로 따르기만 하면 되고, 스스로 금액을 다시 읽고 비교할 필요가 없습니다.
-        '아래 human 메시지의 "금액 판정"은 서버가 이미 계산해 둔 사실입니다. 금액 판정은 "설비·장비를 신규로 구매/도입할지 결정하는 단계"에서 투자심의 대상 여부(owner가 투자관리그룹인지 설비자재구매그룹인지)를 가릴 때만 사용하세요 - 이 경우 질문 속 금액을 스스로 다시 읽고 5억원과 비교하지 말고 판정을 그대로 따르세요: "5억원 이상"이면 심의 주관 부서(예: 투자관리그룹)를 owner로, "미달"이면 실행 부서(예: 설비자재구매그룹)를 owner로 선택하고 needsMoreInfo는 false로 하세요(미달은 범위 밖이 아니라 내부 승인 대상입니다). 이 경우에 한해 판정이 "특정할 수 없습니다"이면 부서를 추측하지 말고 owner를 빈 문자열로, needsMoreInfo를 true로 하여 reason에 금액 확인이 필요하다고 답하세요. 반대로 질문이 이미 구매 이후의 특정 절차(공급사 선정, 계약 체결, 검수·대금지급, 수의계약, 자산등록, 결산 등)를 묻고 있다면 애초에 금액과 무관하게 owner가 정해지므로, 금액 판정이 "특정할 수 없습니다"여도 owner를 비우지 말고 해당 절차를 담당하는 부서로 정상 답변하세요.',
-        'JSON 이외의 글은 출력하지 마세요.'
-      ].join(' ')],
-      ['human', `질문: ${question}\n사업장: ${site ?? '미선택'}\n업무 유형: ${category ?? '자동 분류'}\n금액 판정: ${describeAmountFact(question)}\n\n검색 근거:\n${context}\n\n다음 JSON 형식으로 답하세요: {"needsMoreInfo": boolean, "owner": string, "partners": string[] (관련 부서를 최대한 근거 안에서 찾아 포함, 정말 없으면만 빈 배열), "reason": string, "evidence": [{"quote": string, "source": string}]}`]
-    ]);
-    const raw = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
-    const result = JSON.parse(raw.replace(/^```json\s*|\s*```$/g, '').trim());
-    // 화이트리스트 강제 적용: 프롬프트 지시만으로는 가끔 목록 밖 부서명이 섞여 나올 수 있어
-    // (예: 실제 테스트에서 "결산지원조직"처럼 9개 목록에 없는 이름이 partners에 나온 사례 확인),
-    // 응답을 한 번 더 검증해 목록 밖 값은 제거합니다.
-    const allowedSet = new Set(allowedDepartments);
-    const ownerAllowed = typeof result.owner === 'string' && allowedSet.has(result.owner);
-    const safeOwner = ownerAllowed ? result.owner : '';
-    const safePartners: string[] = Array.isArray(result.partners)
-      ? result.partners.filter((partner: unknown): partner is string => typeof partner === 'string' && allowedSet.has(partner) && partner !== safeOwner)
-      : [];
-    // 온도 0이라도 LLM 호출은 완전히 결정적이지 않습니다. 근거(관련성 임계값을 통과한
-    // primaryDocs)가 이미 확보돼 있는데도 LLM이 가끔 needsMoreInfo:true로 답하는 사례가
-    // 확인되어(동일 질문을 반복하면 결과가 들쭉날쭉함), 서버가 이미 계산해 둔 부서별 관련성
-    // 점수를 신뢰해 owner가 비어 있을 때는 결정적으로 채웁니다. LLM이 owner를 정상적으로
-    // 찾은 경우는 그대로 두고 건드리지 않습니다.
-    // 다만 이 폴백이 LLM의 정당한 판단까지 덮어써서는 안 됩니다(예: 질문 금액이 근거 문서의
-    // 심의 기준 금액에 못 미쳐 "내부 승인 대상"이라고 구체적인 이유를 들어 owner를 비운 경우).
-    // 그런 판단은 프롬프트 지시(reason에 구체적 근거를 적으라는 지시)를 따른 것이므로, reason이
-    // 프롬프트가 제시한 범위-밖 정형 문구와 다르게 구체적으로 채워져 있으면 LLM의 판단을 존중해
-    // 폴백을 건너뜁니다. reason이 비어 있거나 정형 문구 그대로인 경우만 "판단 실패(플레이키)"로
-    // 간주해 기존처럼 관련성 점수로 자동 매칭합니다.
-    const OUT_OF_SCOPE_BOILERPLATE = '투자·회계·구매 관련 업무가 아니거나 추가 확인이 필요합니다';
-    const declinedWithSpecificReason = !ownerAllowed && result.needsMoreInfo === true
-      && typeof result.reason === 'string' && result.reason.trim().length > 0
-      && !result.reason.includes(OUT_OF_SCOPE_BOILERPLATE);
-    const relevantPrimary = primaryRelevance
-      .filter((entry) => entry.docs.length > 0)
-      .sort((a, b) => b.score - a.score);
-    // [3차 개선 - 원인① 1차 수정] 골든셋 평가에서 이 폴백이 "관련 부서가 하나도 없거나(org-001의
-    // 조직도 질문) 근거가 아예 없는(lease-002의 리스 회계처리)" 질문에도 관련성 임계값(0.4)을
-    // 우연히 넘긴 부서가 하나라도 있으면 억지로 owner를 채워버리는 문제를 확인했습니다
-    // (그 결과 reason이 LLM의 실제 판단이 아니라 아래 정형 문구로 덮어써짐).
-    // 1차 수정은 "부서가 정확히 1개일 때만 적용"으로 막았으나, 이 개수 기준은 acc-002처럼
-    // 부서 2~3개가 걸려도 1위가 뚜렷하게 앞서는 정당한 케이스까지 함께 걸러내는 부작용이
-    // 있었습니다(재평가로 확인).
-    // [원인① 2차 수정 - 점수 격차 기반] 골든셋 9개 케이스의 실제 유사도 점수를 계측한 결과
-    // (RAG_DEBUG_SCORES=true로 로깅), 1위-2위 점수 격차가 0.06~0.14인 경우는 1위가 항상
-    // 정답이었고, 격차가 0.005~0.033인 경우는 1위가 정답이 아니거나(acc-001) 애초에 관련
-    // 부서가 없는 질문(org-001, lease-002)이었습니다. 그래서 "개수"가 아니라 "1위가 2위를
-    // 얼마나 확실하게 앞서는지"로 기준을 바꿉니다. 부서가 1개만 걸린 경우는 비교 대상이 없어
-    // 그대로 인정하고, 2개 이상이면 격차가 RELEVANCE_MARGIN 이상일 때만 1위를 신뢰합니다.
-    // (다만 acc-001처럼 격차 자체가 애초에 거의 없는 경우는 이 로직으로도 구제되지 않고
-    // LLM의 needsMoreInfo 판단을 그대로 따릅니다 - 이건 임베딩 신호 자체가 약한 근본적 한계로,
-    // 다음 단계에서는 검색 방식 자체(재순위화 등) 개선이 필요합니다.)
-    const RELEVANCE_MARGIN = 0.05;
-    const hasDominantWinner = relevantPrimary.length === 1
-      || (relevantPrimary.length > 1 && relevantPrimary[0].score - relevantPrimary[1].score >= RELEVANCE_MARGIN);
-    let finalOwner = safeOwner;
-    let finalPartners = safePartners;
-    let finalNeedsMoreInfo = ownerAllowed ? result.needsMoreInfo : true;
-    let finalReason = typeof result.reason === 'string' ? result.reason : '';
-    if (!finalOwner && !declinedWithSpecificReason && hasDominantWinner) {
-      finalOwner = relevantPrimary[0].department;
-      finalNeedsMoreInfo = false;
-      // [3차 개선] 이전에는 2위 이하 부서를 전부 partners로 끼워넣었으나, 격차 기반 판단의
-      // 전제 자체가 "2위 이하는 신뢰할 수 없는 노이즈"라는 것이므로 여기서도 동일하게
-      // 기계적으로 추가하지 않습니다(재평가에서 inv-006/proc-002가 owner는 맞았지만 이
-      // 기계적 추가 때문에 partners가 틀리는 것을 확인). LLM이 스스로 찾은 partners(safePartners)만 사용합니다.
-      finalPartners = safePartners.filter((partner) => partner !== finalOwner);
-      finalReason = '검색된 지침 근거에서 관련 부서가 확인되어 자동으로 매칭되었습니다.';
-    }
-    const safeResult = { ...result, owner: finalOwner, partners: finalPartners, needsMoreInfo: finalNeedsMoreInfo, reason: finalReason };
-    return { ...safeResult, retrieved: docs.map((doc) => ({ content: doc.pageContent, ...doc.metadata })) };
+    const finalState = await ragGraph.invoke({ question, site, category });
+    return {
+      needsMoreInfo: finalState.needsMoreInfo,
+      owner: finalState.owner,
+      partners: finalState.partners,
+      reason: finalState.reason,
+      evidence: finalState.evidence,
+      reReviewed: finalState.reReviewed,
+      retrieved: finalState.docs.map((doc) => ({ content: doc.pageContent, ...doc.metadata })),
+    };
   },
   { name: 'rag-department-match', run_type: 'chain' }
 );
